@@ -559,6 +559,7 @@ int refs_delete_reflog(struct ref_store *refs, const char *refname);
  * functions.
  */
 typedef int each_reflog_ent_fn(
+		const char *refname,
 		struct object_id *old_oid, struct object_id *new_oid,
 		const char *committer, timestamp_t timestamp,
 		int tz, const char *msg, void *cb_data);
