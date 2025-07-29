@@ -3,7 +3,9 @@
 
 #include "builtin.h"
 #include "config.h"
+#include "date.h"
 #include "gettext.h"
+#include "ident.h"
 #include "parse-options.h"
 #include "path.h"
 #include "transport.h"
@@ -612,36 +614,140 @@ static int add_branch_for_removal(const char *refname,
 struct rename_info {
 	const char *old_name;
 	const char *new_name;
-	struct string_list *remote_branches;
-	uint32_t symrefs_nr;
+	struct ref_transaction *tx_create;
+	struct ref_transaction *tx_delete;
+	struct progress *progress;
+	uint32_t progress_nr;
+	struct strbuf *buf1, *buf2, *buf3, *err;
+	struct strbuf *new_refname;
+	uint64_t index;
 };
 
-static int read_remote_branches(const char *refname, const char *referent UNUSED,
-				const struct object_id *oid UNUSED,
-				int flags UNUSED, void *cb_data)
+static void renamed_refname(struct rename_info *rename,
+			    const char *refname,
+			    struct strbuf *out)
+{
+	strbuf_reset(out);
+	strbuf_addstr(out, refname);
+	strbuf_splice(out, strlen("refs/remotes/"), strlen(rename->old_name),
+		      rename->new_name, strlen(rename->new_name));
+}
+
+static int rename_one_reflog_entry(const char *old_refname UNUSED,
+				   struct object_id *old_oid,
+				   struct object_id *new_oid,
+				   const char *committer,
+				   timestamp_t timestamp, int tz,
+				   const char *msg, void *cb_data)
 {
 	struct rename_info *rename = cb_data;
-	struct strbuf buf = STRBUF_INIT;
-	struct string_list_item *item;
-	int flag;
-	const char *symref;
+	struct strbuf *identity = rename->buf1;
+	struct strbuf *name = rename->buf2;
+	struct strbuf *mail = rename->buf3;
+	struct ident_split ident;
+	const char *date;
+	int error;
 
-	strbuf_addf(&buf, "refs/remotes/%s/", rename->old_name);
-	if (starts_with(refname, buf.buf)) {
-		item = string_list_append(rename->remote_branches, refname);
-		symref = refs_resolve_ref_unsafe(get_main_ref_store(the_repository),
-						 refname, RESOLVE_REF_READING,
-						 NULL, &flag);
-		if (symref && (flag & REF_ISSYMREF)) {
-			item->util = xstrdup(symref);
-			rename->symrefs_nr++;
-		} else {
-			item->util = NULL;
-		}
+	if (split_ident_line(&ident, committer, strlen(committer)) < 0)
+		return -1;
+
+	strbuf_reset(name);
+	strbuf_add(name, ident.name_begin, ident.name_end - ident.name_begin);
+	strbuf_reset(mail);
+	strbuf_add(mail, ident.mail_begin, ident.mail_end - ident.mail_begin);
+
+	date = show_date(timestamp, tz, DATE_MODE(NORMAL));
+	strbuf_reset(identity);
+	strbuf_addstr(identity, fmt_ident(name->buf, mail->buf,
+					  WANT_BLANK_IDENT, date, 0));
+
+	error = ref_transaction_update_reflog(rename->tx_create, rename->new_refname->buf,
+					      new_oid, old_oid, identity->buf, msg,
+					      rename->index++, rename->err);
+
+	return error;
+}
+
+static int rename_one_reflog(const char *old_refname,
+			     const struct object_id *old_oid,
+			     struct rename_info *rename)
+{
+	struct strbuf *message = rename->buf1;
+	int error;
+
+	if (!refs_reflog_exists(get_main_ref_store(the_repository), old_refname))
+		return 0;
+
+	error = refs_for_each_reflog_ent(get_main_ref_store(the_repository),
+					 old_refname, rename_one_reflog_entry, rename);
+	if (error < 0)
+		return error;
+
+	/*
+	 * Manually write the reflog entry for the now-renamed ref. We cannot
+	 * rely on `rename_one_ref()` to do this for us as that would screw
+	 * over order in which reflog entries are being written.
+	 *
+	 * Furthermore, we only append the entry in case the reference
+	 * resolves. Missing references shouldn't have reflogs anyway.
+	 */
+	strbuf_reset(message);
+	strbuf_addf(message, "remote: renamed %s to %s", old_refname,
+		    rename->new_refname->buf);
+
+	error = ref_transaction_update_reflog(rename->tx_create, rename->new_refname->buf,
+					      old_oid, old_oid, git_committer_info(0),
+					      message->buf, rename->index++, rename->err);
+	if (error < 0)
+		return error;
+
+	return error;
+}
+
+static int rename_one_ref(const char *old_refname, const char *referent,
+			  const struct object_id *oid,
+			  int flags, void *cb_data)
+{
+	struct rename_info *rename = cb_data;
+	struct strbuf *new_referent = rename->buf1;
+	int error;
+
+	renamed_refname(rename, old_refname, rename->new_refname);
+
+	if (flags & REF_ISSYMREF) {
+		/*
+		 * Stupidly enough `referent` is not pointing to the immediate
+		 * target of a symref, but it's the recursively resolved value.
+		 * So symrefs pointing to symrefs would be misresolved, and
+		 * unborn symrefs don't have any value for the `referent` at all.
+		 */
+		referent = refs_resolve_ref_unsafe(get_main_ref_store(the_repository),
+						   old_refname, RESOLVE_REF_NO_RECURSE,
+						   NULL, NULL);
+		renamed_refname(rename, referent, new_referent);
+		oid = NULL;
 	}
-	strbuf_release(&buf);
 
-	return 0;
+	error = ref_transaction_delete(rename->tx_delete, old_refname,
+				       oid, referent, REF_NO_DEREF, NULL, rename->err);
+	if (error < 0)
+		goto out;
+
+	error = ref_transaction_update(rename->tx_create, rename->new_refname->buf, oid, null_oid(the_hash_algo),
+				       (flags & REF_ISSYMREF) ? new_referent->buf : NULL, NULL,
+				       REF_SKIP_CREATE_REFLOG | REF_NO_DEREF | REF_SKIP_OID_VERIFICATION,
+				       NULL, rename->err);
+	if (error < 0)
+		goto out;
+
+	error = rename_one_reflog(old_refname, oid, rename);
+	if (error < 0)
+		goto out;
+
+	display_progress(rename->progress, ++rename->progress_nr);
+
+out:
+	return error;
 }
 
 static int migrate_file(struct remote *remote)
@@ -730,7 +836,6 @@ static void handle_push_default(const char* old_name, const char* new_name)
 	strbuf_release(&push_default.origin);
 }
 
-
 static int mv(int argc, const char **argv, const char *prefix,
 	      struct repository *repo UNUSED)
 {
@@ -741,11 +846,15 @@ static int mv(int argc, const char **argv, const char *prefix,
 	};
 	struct remote *oldremote, *newremote;
 	struct strbuf buf = STRBUF_INIT, buf2 = STRBUF_INIT, buf3 = STRBUF_INIT,
-		old_remote_context = STRBUF_INIT;
-	struct string_list remote_branches = STRING_LIST_INIT_DUP;
-	struct rename_info rename;
-	int i, refs_renamed_nr = 0, refspec_updated = 0;
-	struct progress *progress = NULL;
+		old_remote_context = STRBUF_INIT, err = STRBUF_INIT;
+	struct rename_info rename = {
+		.buf1 = &buf,
+		.buf2 = &buf2,
+		.buf3 = &buf3,
+		.new_refname = &old_remote_context,
+		.err = &err,
+	};
+	int i, refspec_updated = 0;
 	int result = 0;
 
 	argc = parse_options(argc, argv, prefix, options,
@@ -756,8 +865,6 @@ static int mv(int argc, const char **argv, const char *prefix,
 
 	rename.old_name = argv[0];
 	rename.new_name = argv[1];
-	rename.remote_branches = &remote_branches;
-	rename.symrefs_nr = 0;
 
 	oldremote = remote_get(rename.old_name);
 	if (!remote_is_configured(oldremote, 1)) {
@@ -832,79 +939,63 @@ static int mv(int argc, const char **argv, const char *prefix,
 		goto out;
 
 	/*
-	 * First remove symrefs, then rename the rest, finally create
-	 * the new symrefs.
+	 * Note that we're using two transactions to rename the references:
+	 *
+	 *   - One transaction contains all deletions for references part of
+	 *     the old remote.
+	 *   - One transaction contains all creations of references and reflogs
+	 *     part of the new remote.
+	 *
+	 * This split is required to avoid conflicting ref updates when a
+	 * remote is being nested into itself or converted into its parent
+	 * directory.
+	 *
+	 * Unfortunately this means that the operation isn't atomic. But we
+	 * cannot avoid that, unless transactions learn to handle such
+	 * conflicts one day.
 	 */
-	refs_for_each_ref(get_main_ref_store(the_repository),
-			  read_remote_branches, &rename);
-	if (show_progress) {
-		/*
-		 * Count symrefs twice, since "renaming" them is done by
-		 * deleting and recreating them in two separate passes.
-		 */
-		progress = start_progress(the_repository,
-					  _("Renaming remote references"),
-					  rename.remote_branches->nr + rename.symrefs_nr);
-	}
-	for (i = 0; i < remote_branches.nr; i++) {
-		struct string_list_item *item = remote_branches.items + i;
-		struct strbuf referent = STRBUF_INIT;
+	rename.tx_delete = ref_store_transaction_begin(get_main_ref_store(the_repository),
+						       0, &err);
+	if (!rename.tx_delete)
+		goto out;
 
-		if (refs_read_symbolic_ref(get_main_ref_store(the_repository), item->string,
-					   &referent))
-			continue;
-		if (refs_delete_ref(get_main_ref_store(the_repository), NULL, item->string, NULL, REF_NO_DEREF))
-			die(_("deleting '%s' failed"), item->string);
+	rename.tx_create = ref_store_transaction_begin(get_main_ref_store(the_repository),
+						       0, &err);
+	if (!rename.tx_create)
+		goto out;
 
-		strbuf_release(&referent);
-		display_progress(progress, ++refs_renamed_nr);
-	}
-	for (i = 0; i < remote_branches.nr; i++) {
-		struct string_list_item *item = remote_branches.items + i;
+	if (show_progress)
+		rename.progress = start_delayed_progress(the_repository,
+							 _("Renaming remote references"), 0);
 
-		if (item->util)
-			continue;
-		strbuf_reset(&buf);
-		strbuf_addstr(&buf, item->string);
-		strbuf_splice(&buf, strlen("refs/remotes/"), strlen(rename.old_name),
-				rename.new_name, strlen(rename.new_name));
-		strbuf_reset(&buf2);
-		strbuf_addf(&buf2, "remote: renamed %s to %s",
-				item->string, buf.buf);
-		if (refs_rename_ref(get_main_ref_store(the_repository), item->string, buf.buf, buf2.buf))
-			die(_("renaming '%s' failed"), item->string);
-		display_progress(progress, ++refs_renamed_nr);
-	}
-	for (i = 0; i < remote_branches.nr; i++) {
-		struct string_list_item *item = remote_branches.items + i;
+	strbuf_reset(&buf);
+	strbuf_addf(&buf, "refs/remotes/%s/", rename.old_name);
 
-		if (!item->util)
-			continue;
-		strbuf_reset(&buf);
-		strbuf_addstr(&buf, item->string);
-		strbuf_splice(&buf, strlen("refs/remotes/"), strlen(rename.old_name),
-				rename.new_name, strlen(rename.new_name));
-		strbuf_reset(&buf2);
-		strbuf_addstr(&buf2, item->util);
-		strbuf_splice(&buf2, strlen("refs/remotes/"), strlen(rename.old_name),
-				rename.new_name, strlen(rename.new_name));
-		strbuf_reset(&buf3);
-		strbuf_addf(&buf3, "remote: renamed %s to %s",
-				item->string, buf.buf);
-		if (refs_update_symref(get_main_ref_store(the_repository), buf.buf, buf2.buf, buf3.buf))
-			die(_("creating '%s' failed"), buf.buf);
-		display_progress(progress, ++refs_renamed_nr);
-	}
-	stop_progress(&progress);
+	result = refs_for_each_rawref_in(get_main_ref_store(the_repository), buf.buf,
+					 rename_one_ref, &rename);
+	if (result < 0)
+		die(_("renaming references failed: %s"), rename.err->buf);
+
+	result = ref_transaction_commit(rename.tx_delete, &err);
+	if (result < 0)
+		die(_("deleting old remote refs failed: %s"), rename.err->buf);
+
+	result = ref_transaction_commit(rename.tx_create, &err);
+	if (result < 0)
+		die(_("committing new remote refs failed: %s"), rename.err->buf);
+
+	stop_progress(&rename.progress);
 
 	handle_push_default(rename.old_name, rename.new_name);
 
 out:
-	string_list_clear(&remote_branches, 1);
+	ref_transaction_free(rename.tx_create);
+	ref_transaction_free(rename.tx_delete);
 	strbuf_release(&old_remote_context);
 	strbuf_release(&buf);
 	strbuf_release(&buf2);
 	strbuf_release(&buf3);
+	strbuf_release(&err);
 	return result;
 }
 
